@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from solax import RealTimeAPI
 from solax.inverter import InverterError
@@ -25,11 +24,15 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_time_change,
+    async_track_time_interval,
+)
+from homeassistant.util import dt as util_dt
 
 from .const import DOMAIN, MANUFACTURER
 
@@ -108,6 +111,7 @@ async def async_setup_entry(
     resp = await api.get_data()
     serial = resp.serial_number
     version = resp.version
+    last_reset = util_dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
     endpoint = RealTimeDataEndpoint(hass, api)
     entry.async_create_background_task(
         hass, endpoint.async_refresh(), f"solax {entry.title} initial refresh"
@@ -122,19 +126,27 @@ async def async_setup_entry(
         ]
 
         uid = f"{serial}-{idx}"
-        devices.append(
-            Inverter(
-                api.inverter.manufacturer,
-                uid,
-                serial,
-                version,
-                sensor,
-                description.native_unit_of_measurement,
-                description.state_class,
-                description.device_class,
-                measurement.resets_daily,
-            )
+        device = Inverter(
+            api.inverter.manufacturer,
+            uid,
+            serial,
+            version,
+            sensor,
+            description.native_unit_of_measurement,
+            description.state_class,
+            description.device_class,
+            last_reset if measurement.resets_daily else None,
         )
+        if measurement.resets_daily:
+            async_track_time_change(
+                hass=hass,
+                action=device.async_listen_for_midnight,
+                hour=0,
+                minute=0,
+                second=0,
+            )
+
+        devices.append(device)
     endpoint.sensors = devices
     async_add_entities(devices)
 
@@ -146,7 +158,6 @@ class RealTimeDataEndpoint:
         """Initialize the sensor."""
         self.hass = hass
         self.api = api
-        self.ready = asyncio.Event()
         self.sensors: list[Inverter] = []
 
     async def async_refresh(self, now=None):
@@ -156,18 +167,28 @@ class RealTimeDataEndpoint:
         """
         try:
             api_response = await self.api.get_data()
-            self.ready.set()
-        except InverterError as err:
+            if (
+                not api_response
+                or "Total Energy" not in api_response.data
+                or api_response.data["Total Energy"] == 0
+            ):
+                import logging
+
+                if api_response:
+                    logging.info(f"{api_response.data=}")
+                    logging.info(f"{api_response.serial_number=}")
+                    logging.info(f"{api_response.type=}")
+                    logging.info(f"{api_response.version=}")
+                else:
+                    logging.info(f"{api_response=}")
+        except (InverterError, TimeoutError) as err:
             if now is not None:
-                self.ready.clear()
                 return
             raise PlatformNotReady from err
         data = api_response.data
         for sensor in self.sensors:
             if sensor.key in data:
                 sensor.value = data[sensor.key]
-                if sensor.resets_daily:
-                    sensor.last_reset = now or datetime.now()
                 sensor.async_schedule_update_ha_state()
 
 
@@ -186,13 +207,14 @@ class Inverter(SensorEntity):
         unit,
         state_class=None,
         device_class=None,
-        resets_daily=False,
+        last_reset=None,
     ) -> None:
         """Initialize an inverter sensor."""
         self._attr_unique_id = uid
         self._attr_name = f"{manufacturer} {serial} {key}"
         self._attr_native_unit_of_measurement = unit
         self._attr_state_class = state_class
+        self._attr_last_reset = last_reset
         self._attr_device_class = device_class
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, serial)},
@@ -200,23 +222,19 @@ class Inverter(SensorEntity):
             name=f"{manufacturer} {serial}",
             sw_version=version,
         )
-        if resets_daily:
-            self.last_reset = datetime.now()
         self.key = key
         self.value = None
-        self.resets_daily = resets_daily
 
-    @property
-    def last_reset(self) -> datetime | None:
-        """Return last reset in UTC."""
-        return self._attr_last_reset
+    @callback
+    def async_listen_for_midnight(self, midnight: datetime) -> None:
+        """Reset at midnight."""
+        import logging
 
-    @last_reset.setter
-    def last_reset(self, now: datetime) -> None:
-        """Set last reset to now as UTC truncated to year, month, day."""
-        self._attr_last_reset = now.astimezone(UTC).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        del self.last_reset
+        logging.info("midnight: %s", midnight)
+        self._attr_last_reset = midnight
+        # self.value = 0
+        # self.async_schedule_update_ha_state()
 
     @property
     def native_value(self):
