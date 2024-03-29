@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from solax import RealTimeAPI
-from solax.discovery import InverterError
+from solax.inverter import InverterError
 from solax.units import Units
 
 from homeassistant.components.sensor import (
@@ -34,60 +34,66 @@ from homeassistant.helpers.event import async_track_time_interval
 from .const import DOMAIN, MANUFACTURER
 
 DEFAULT_PORT = 80
-SCAN_INTERVAL = timedelta(seconds=30)
+SCAN_INTERVAL = timedelta(seconds=5)
 
 
-SENSOR_DESCRIPTIONS: dict[tuple[Units, bool], SensorEntityDescription] = {
-    (Units.C, False): SensorEntityDescription(
-        key=f"{Units.C}_{False}",
+SENSOR_DESCRIPTIONS: dict[tuple[Units, bool, bool], SensorEntityDescription] = {
+    (Units.C, False, False): SensorEntityDescription(
+        key=f"{Units.C}_{False}_{False}",
         device_class=SensorDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.KWH, False): SensorEntityDescription(
-        key=f"{Units.KWH}_{False}",
-        device_class=SensorDeviceClass.ENERGY,
+    (Units.KWH, False, True): SensorEntityDescription(
+        key=f"{Units.KWH}_{False}_{True}",
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.KWH, True): SensorEntityDescription(
-        key=f"{Units.KWH}_{True}",
+    (Units.KWH, False, False): SensorEntityDescription(
+        key=f"{Units.KWH}_{False}_{False}",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+    ),
+    (Units.KWH, True, False): SensorEntityDescription(
+        key=f"{Units.KWH}_{True}_{False}",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
-    (Units.V, False): SensorEntityDescription(
-        key=f"{Units.V}_{False}",
+    (Units.V, False, False): SensorEntityDescription(
+        key=f"{Units.V}_{False}_{False}",
         device_class=SensorDeviceClass.VOLTAGE,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.A, False): SensorEntityDescription(
-        key=f"{Units.A}_{False}",
+    (Units.A, False, False): SensorEntityDescription(
+        key=f"{Units.A}_{False}_{False}",
         device_class=SensorDeviceClass.CURRENT,
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.W, False): SensorEntityDescription(
-        key=f"{Units.W}_{False}",
+    (Units.W, False, False): SensorEntityDescription(
+        key=f"{Units.W}_{False}_{False}",
         device_class=SensorDeviceClass.POWER,
         native_unit_of_measurement=UnitOfPower.WATT,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.PERCENT, False): SensorEntityDescription(
-        key=f"{Units.PERCENT}_{False}",
+    (Units.PERCENT, False, False): SensorEntityDescription(
+        key=f"{Units.PERCENT}_{False}_{False}",
         device_class=SensorDeviceClass.BATTERY,
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.HZ, False): SensorEntityDescription(
-        key=f"{Units.HZ}_{False}",
+    (Units.HZ, False, False): SensorEntityDescription(
+        key=f"{Units.HZ}_{False}_{False}",
         device_class=SensorDeviceClass.FREQUENCY,
         native_unit_of_measurement=UnitOfFrequency.HERTZ,
         state_class=SensorStateClass.MEASUREMENT,
     ),
-    (Units.NONE, False): SensorEntityDescription(
-        key=f"{Units.NONE}_{False}",
+    (Units.NONE, False, False): SensorEntityDescription(
+        key=f"{Units.NONE}_{False}_{False}",
     ),
 }
 
@@ -111,7 +117,9 @@ async def async_setup_entry(
     )
     devices = []
     for sensor, (idx, measurement) in api.inverter.sensor_map().items():
-        description = SENSOR_DESCRIPTIONS[(measurement.unit, measurement.is_monotonic)]
+        description = SENSOR_DESCRIPTIONS[
+            (measurement.unit, measurement.is_monotonic, measurement.storage)
+        ]
 
         uid = f"{serial}-{idx}"
         devices.append(
@@ -124,6 +132,7 @@ async def async_setup_entry(
                 description.native_unit_of_measurement,
                 description.state_class,
                 description.device_class,
+                measurement.resets_daily,
             )
         )
     endpoint.sensors = devices
@@ -157,6 +166,8 @@ class RealTimeDataEndpoint:
         for sensor in self.sensors:
             if sensor.key in data:
                 sensor.value = data[sensor.key]
+                if sensor.resets_daily:
+                    sensor.last_reset = now or datetime.now()
                 sensor.async_schedule_update_ha_state()
 
 
@@ -175,7 +186,8 @@ class Inverter(SensorEntity):
         unit,
         state_class=None,
         device_class=None,
-    ):
+        resets_daily=False,
+    ) -> None:
         """Initialize an inverter sensor."""
         self._attr_unique_id = uid
         self._attr_name = f"{manufacturer} {serial} {key}"
@@ -188,8 +200,23 @@ class Inverter(SensorEntity):
             name=f"{manufacturer} {serial}",
             sw_version=version,
         )
+        if resets_daily:
+            self.last_reset = datetime.now()
         self.key = key
         self.value = None
+        self.resets_daily = resets_daily
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return last reset in UTC."""
+        return self._attr_last_reset
+
+    @last_reset.setter
+    def last_reset(self, now: datetime) -> None:
+        """Set last reset to now as UTC truncated to year, month, day."""
+        self._attr_last_reset = now.astimezone(UTC).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
 
     @property
     def native_value(self):
